@@ -15,6 +15,7 @@ from PyNucleus_base.myTypes cimport INDEX_t, REAL_t, BOOL_t
 from PyNucleus_base.linear_operators cimport (LinearOperator,
                                                Dense_LinearOperator)
 from PyNucleus_base.tupleDict cimport indexSet, indexSetIterator, arrayIndexSet, arrayIndexSetIterator, bitArray
+from PyNucleus_base.performanceLogger cimport PLogger, FakePLogger
 from PyNucleus_fem.DoFMaps cimport DoFMap
 from PyNucleus_fem.meshCy cimport meshBase
 from . fractionalOrders cimport fractionalOrderBase
@@ -44,6 +45,18 @@ cdef enum refinementType:
     MEDIAN
 
 
+cdef struct refinementParams:
+    INDEX_t maxLevels
+    INDEX_t maxLevelsMixed
+    INDEX_t minSize
+    INDEX_t minMixedSize
+    refinementType refType
+    BOOL_t splitEveryDim
+    REAL_t eta
+    INDEX_t farFieldInteractionSize
+    INDEX_t interpolation_order
+
+
 cdef class tree_node:
     cdef:
         public tree_node parent
@@ -60,13 +73,16 @@ cdef class tree_node:
         public REAL_t[::1] coefficientsUp, coefficientsDown
         public BOOL_t mixed_node
         public BOOL_t canBeAssembled
+        public INDEX_t levelNo
+        public INDEX_t coefficientsUpOffset
     cdef indexSet get_dofs(self)
     cdef INDEX_t get_num_dofs(self)
     cdef indexSet get_cells(self)
     cdef BOOL_t get_is_leaf(self)
     cdef INDEX_t _getLevels(self)
+    cdef INDEX_t _getParentLevels(self)
     cdef void prepareTransferOperators(self, INDEX_t m, transferMatrixBuilder tMB=*)
-    cdef void upwardPass(self, REAL_t[::1] x, INDEX_t componentNo=*)
+    cdef void upwardPass(self, REAL_t[::1] x, INDEX_t componentNo=*, BOOL_t skip_leaves=*)
     cdef void resetCoefficientsDown(self)
     cdef void downwardPass(self, REAL_t[::1] y, INDEX_t componentNo=*)
     cpdef INDEX_t findCell(self, meshBase mesh, REAL_t[::1] vertex, REAL_t[:, ::1] simplex, REAL_t[::1] bary)
@@ -97,9 +113,18 @@ cdef class H2Matrix(LinearOperator):
         public LinearOperator Anear
         public dict Pfar
         public tree_node tree
+        public FakePLogger PLogger
+        public LinearOperator basis
+        public BOOL_t skip_leaves_upward
+        public REAL_t[::1] leafCoefficientsUp
     cdef INDEX_t matvec(self,
                         REAL_t[::1] x,
                         REAL_t[::1] y) except -1
+    cdef INDEX_t matvec_submat(self,
+                               REAL_t[::1] x,
+                               REAL_t[::1] y,
+                               tree_node right,
+                               tree_node left) except -1
 
 
 cdef class DistributedH2Matrix(LinearOperator):

@@ -48,6 +48,7 @@ from . clusterMethodCy import (assembleFarFieldInteractions,
                                symmetrizeNearFieldClusters,
                                trimTree)
 from . clusterMethodCy cimport (refinementType,
+                                refinementParams,
                                 GEOMETRIC,
                                 MEDIAN,
                                 BARYCENTER)
@@ -1802,7 +1803,7 @@ cdef class nonlocalBuilder:
                         jumps[hv] = hv2
         return blocks, jumps
 
-    def getTree(self, BOOL_t doDistributedAssembly, INDEX_t maxLevels, INDEX_t minClusterSize, INDEX_t minMixedClusterSize, REAL_t eta, INDEX_t minFarFieldBlockSize):
+    def getTree(self, BOOL_t doDistributedAssembly, refinementParams refParams):
         cdef:
             REAL_t[:, :, ::1] boxes = None
             list cells = []
@@ -1816,17 +1817,6 @@ cdef class nonlocalBuilder:
             INDEX_t[::1] part = None
             set myCells
             tree_node root, myRoot, n
-            refinementType refType
-            BOOL_t splitEveryDim
-
-        rT = self.params.get('refinementType', 'MEDIAN')
-        refType = {'geometric': GEOMETRIC,
-                   'GEOMETRIC': GEOMETRIC,
-                   'median': MEDIAN,
-                   'MEDIAN': MEDIAN,
-                   'barycenter': BARYCENTER,
-                   'BARYCENTER': BARYCENTER}[rT]
-        splitEveryDim = self.params.get('splitEveryDim', False)
 
         with self.PLogger.Timer('prepare tree'):
             boxes, cells = getDoFBoxesAndCells(self.dm.mesh, self.dm, self.comm)
@@ -1860,9 +1850,9 @@ cdef class nonlocalBuilder:
 
                     self.params['partitioner'] = 'metis'
                     (root, myRoot, _, tempMyDofs, _,
-                     doDistributedAssemblyTemp, _) = self.getTree(doDistributedAssembly, maxLevels, minClusterSize, minMixedClusterSize, eta, minFarFieldBlockSize)
+                     doDistributedAssemblyTemp) = self.getTree(doDistributedAssembly, refParams)
                     # get the admissible cluster pairs
-                    Pnear, _ = self.getAdmissibleClusters(root, myRoot, doDistributedAssemblyTemp, eta, minFarFieldBlockSize)
+                    Pnear, _ = self.getAdmissibleClusters(root, myRoot, doDistributedAssemblyTemp, refParams, boxes, cells, coords)
                     tempAnear = getSparseNearField(self.dm, Pnear, False)
                     tempAnear = self.reduceNearOp(tempAnear, tempMyDofs)
 
@@ -1914,46 +1904,42 @@ cdef class nonlocalBuilder:
                     n._dofs = None
                 LOGGER.info('Jumps: {}, Block sizes: {}, Leaf nodes: {}'.format(len(jumps), str({key: len(blocks[key]) for key in blocks}), len(list(root.leaves()))))
 
-            for n in root.leaves():
-                # if not n.mixed_node:
-                n.refine(boxes, coords, maxLevels=maxLevels, minSize=minClusterSize, minMixedSize=minMixedClusterSize, refType=refType, splitEveryDim=splitEveryDim)
+            if doDistributedAssembly:
+                for n in root.leaves():
+                    # if not n.mixed_node:
+                    n.refine(boxes, coords, refParams)
 
-            # recursively set tree node ids
-            root.set_id()
+            # # Enter cells in leaf nodes, update boxes (if we stopped
+            # # at maxLevels, before each DoF has only it's support as
+            # # box)
+            # it = arrayIndexSetIterator()
+            # for n in root.leaves():
+            #     box = n.box
+            #     myCells = set()
+            #     it.setIndexSet(n.dofs)
+            #     while it.step():
+            #         dof = it.i
+            #         myCells |= cells[dof]
 
-            # enter cells in leaf nodes
-            it = arrayIndexSetIterator()
-            for n in root.leaves():
-                myCells = set()
-                it.setIndexSet(n.dofs)
-                while it.step():
-                    dof = it.i
-                    myCells |= cells[dof]
-                n._cells = arrayIndexSet()
-                n._cells.fromSet(myCells)
-            del cells
+            #         for i in range(self.dm.mesh.dim):
+            #             for j in range(2):
+            #                 boxes[dof, i, j] = box[i, j]
+            #     n._cells = arrayIndexSet()
+            #     n._cells.fromSet(myCells)
+            # del cells
 
-            # update boxes (if we stopped at maxLevels, before each DoF has
-            # only it's support as box)
-            for n in root.leaves():
-                box = n.box
-                it.setIndexSet(n.dofs)
-                while it.step():
-                    dof = it.i
-                    for i in range(self.dm.mesh.dim):
-                        for j in range(2):
-                            boxes[dof, i, j] = box[i, j]
+            if refParams.maxLevels <= 0:
+                refParams.maxLevels = root.numLevels+refParams.maxLevels
 
-            if maxLevels <= 0:
-                maxLevels = root.numLevels+maxLevels
-
-            return root, myRoot, boxes, myDofs, jumps, doDistributedAssembly, maxLevels
+            return root, myRoot, boxes, cells, coords, myDofs, jumps, doDistributedAssembly
 
     def getAdmissibleClusters(self,
                               tree_node root, tree_node myRoot,
                               BOOL_t doDistributedAssembly,
-                              REAL_t eta,
-                              INDEX_t minFarFieldBlockSize,
+                              refinementParams refParams,
+                              REAL_t[:, :, ::1] boxes,
+                              list cells,
+                              REAL_t[:, ::1] coords,
                               BOOL_t assembleOnRoot=True):
         cdef:
             dict Pfar = {}
@@ -1968,10 +1954,16 @@ cdef class nonlocalBuilder:
             if doDistributedAssembly:
                 for n in root.children:
                     getAdmissibleClusters(self.local_matrix.kernel, myRoot, n,
-                                          eta=eta, farFieldInteractionSize=minFarFieldBlockSize,
+                                          refParams,
                                           Pfar=Pfar, Pnear=Pnear)
-                counts = np.zeros((self.comm.size), dtype=INDEX)
+
+                # recursively set tree node ids
+                root.set_id()
+
                 symmetrizeNearFieldClusters(Pnear)
+                # for cPnear in Pnear:
+                #     cPnear.set_cells()
+                counts = np.zeros((self.comm.size), dtype=INDEX)
                 self.comm.Gather(np.array([len(Pnear)], dtype=INDEX), counts)
                 LOGGER.info('Near field cluster pairs per rank: {} ({}) / {} / {} ({})'.format(counts.min(), counts.argmin(), counts.mean(), counts.max(), counts.argmax()))
 
@@ -2023,11 +2015,98 @@ cdef class nonlocalBuilder:
                         Pfar = {}
             else:
                 getAdmissibleClusters(self.local_matrix.kernel, root, root,
-                                      eta=eta, farFieldInteractionSize=minFarFieldBlockSize,
-                                      Pfar=Pfar, Pnear=Pnear)
+                                      refParams,
+                                      Pfar=Pfar, Pnear=Pnear,
+                                      attemptRefinement=True,
+                                      boxes=boxes,
+                                      coords=coords)
+
+                # recursively set tree node ids
+                root.set_id()
+
+            # Enter cells in leaf nodes, update boxes (if we stopped
+            # at maxLevels, before each DoF has only it's support as
+            # box)
+            it = arrayIndexSetIterator()
+            for n in root.leaves():
+                box = n.box
+                myCells = set()
+                it.setIndexSet(n.dofs)
+                while it.step():
+                    dof = it.i
+                    myCells |= cells[dof]
+
+                    for i in range(self.dm.mesh.dim):
+                        for j in range(2):
+                            boxes[dof, i, j] = box[i, j]
+                n._cells = arrayIndexSet()
+                n._cells.fromSet(myCells)
+            del cells
+
             if self.params.get('trim', True):
                 trimTree(root, Pnear, Pfar, self.comm)
+            for cPnear in Pnear:
+                cPnear.set_cells()
         return Pnear, Pfar
+
+    def getH2RefinementParams(self):
+        cdef:
+            meshBase mesh = self.mesh
+            fractionalOrderBase s = self.kernel.s
+            refinementParams refParams
+
+        target_order = self.local_matrix.target_order
+        refParams.eta = self.params.get('eta', 3.)
+
+        iO = self.params.get('interpolation_order', None)
+        if iO is None:
+            loggamma = abs(np.log(0.25))
+            refParams.interpolation_order = max(np.ceil((2*target_order+max(mesh.dim+2*s.max, 2))*abs(np.log(mesh.hmin/mesh.diam))/loggamma/3.), 2)
+        else:
+            refParams.interpolation_order = iO
+        mL = self.params.get('maxLevels', None)
+        if mL is None:
+            # maxLevels = max(int(np.around(np.log2(DoFMap.num_dofs)/mesh.dim-np.log2(refParams.interpolation_order))), 0)
+            refParams.maxLevels = 200
+        else:
+            refParams.maxLevels = mL
+        refParams.maxLevelsMixed = refParams.maxLevels
+        mCS = self.params.get('minClusterSize', None)
+        if mCS is None:
+            refParams.minSize = refParams.interpolation_order**mesh.dim//2
+        else:
+            refParams.minSize = mCS
+        if self.kernel.finiteHorizon:
+            refParams.minMixedSize = max(min(self.kernel.horizon.value//(2*mesh.h)-1, refParams.minSize), 1)
+        else:
+            refParams.minMixedSize = refParams.minSize
+        mFFBS = self.params.get('minFarFieldBlockSize', None)
+        if mFFBS is None:
+            # For this value, size(kernelInterpolant) == size(dense block)
+            # If we choose a smaller value for minFarFieldBlockSize, then we use more memory,
+            # but we might save time, since the assembly of a far field block is cheaper than a near field block.
+            refParams.farFieldInteractionSize = refParams.interpolation_order**(2*mesh.dim)
+        else:
+            refParams.farFieldInteractionSize = mFFBS
+
+        rT = self.params.get('refinementType', 'MEDIAN')
+        refParams.refType = {'geometric': GEOMETRIC,
+                             'GEOMETRIC': GEOMETRIC,
+                             'median': MEDIAN,
+                             'MEDIAN': MEDIAN,
+                             'barycenter': BARYCENTER,
+                             'BARYCENTER': BARYCENTER}[rT]
+
+        refParams.splitEveryDim = self.params.get('splitEveryDim', False)
+
+        LOGGER.info('interpolation_order: {}, maxLevels: {}, minClusterSize: {}, minMixedClusterSize: {}, minFarFieldBlockSize: {}, eta: {}'.format(refParams.interpolation_order,
+                                                                                                                                                    refParams.maxLevels,
+                                                                                                                                                    refParams.minSize,
+                                                                                                                                                    refParams.minMixedSize,
+                                                                                                                                                    refParams.farFieldInteractionSize,
+                                                                                                                                                    refParams.eta))
+
+        return refParams
 
     def getH2(self, BOOL_t returnNearField=False, returnTree=False):
         cdef:
@@ -2041,51 +2120,21 @@ cdef class nonlocalBuilder:
             LinearOperator h2 = None, Anear = None
             dict jumps
             indexSet myDofs
-            INDEX_t interpolation_order, maxLevels, minClusterSize, minMixedClusterSize, minFarFieldBlockSize
             BOOL_t forceUnsymmetric, doDistributedAssembly = False, assembleOnRoot = True
+            refinementParams refParams
         assert isinstance(self.kernel, FractionalKernel), 'H2 is only implemented for fractional kernels'
 
-        target_order = self.local_matrix.target_order
-        eta = self.params.get('eta', 3.)
-
-        iO = self.params.get('interpolation_order', None)
-        if iO is None:
-            loggamma = abs(np.log(0.25))
-            interpolation_order = max(np.ceil((2*target_order+max(mesh.dim+2*s.max, 2))*abs(np.log(mesh.hmin/mesh.diam))/loggamma/3.), 2)
-        else:
-            interpolation_order = iO
-        mL = self.params.get('maxLevels', None)
-        if mL is None:
-            # maxLevels = max(int(np.around(np.log2(DoFMap.num_dofs)/mesh.dim-np.log2(interpolation_order))), 0)
-            maxLevels = 200
-        else:
-            maxLevels = mL
-        mCS = self.params.get('minClusterSize', None)
-        if mCS is None:
-            minClusterSize = interpolation_order**mesh.dim//2
-        else:
-            minClusterSize = mCS
-        minMixedClusterSize = minClusterSize
-        if self.kernel.finiteHorizon:
-            minMixedClusterSize = max(min(self.kernel.horizon.value//(2*mesh.h)-1, minClusterSize), 1)
-        mFFBS = self.params.get('minFarFieldBlockSize', None)
-        if mFFBS is None:
-            # For this value, size(kernelInterpolant) == size(dense block)
-            # If we choose a smaller value for minFarFieldBlockSize, then we use more memory,
-            # but we might save time, since the assembly of a far field block is cheaper than a near field block.
-            minFarFieldBlockSize = interpolation_order**(2*mesh.dim)
-        else:
-            minFarFieldBlockSize = mFFBS
+        refParams = self.getH2RefinementParams()
         forceUnsymmetric = self.params.get('forceUnsymmetric', False)
         doDistributedAssembly = self.comm is not None and self.comm.size > 1 and DoFMap.num_dofs > self.comm.size
         assembleOnRoot = self.params.get('assembleOnRoot', True)
-        LOGGER.info('interpolation_order: {}, maxLevels: {}, minClusterSize: {}, minMixedClusterSize: {}, minFarFieldBlockSize: {}, distributedAssembly: {}, eta: {}'.format(interpolation_order, maxLevels, minClusterSize, minMixedClusterSize, minFarFieldBlockSize, doDistributedAssembly, eta))
 
         # construct the cluster tree
-        (root, myRoot, boxes, myDofs, jumps,
-         doDistributedAssembly, maxLevels) = self.getTree(doDistributedAssembly, maxLevels, minClusterSize, minMixedClusterSize, eta, minFarFieldBlockSize)
+        (root, myRoot, boxes, cells, coords, myDofs, jumps,
+         doDistributedAssembly) = self.getTree(doDistributedAssembly, refParams)
+
         # get the admissible cluster pairs
-        Pnear, Pfar = self.getAdmissibleClusters(root, myRoot, doDistributedAssembly, eta, minFarFieldBlockSize, assembleOnRoot=assembleOnRoot)
+        Pnear, Pfar = self.getAdmissibleClusters(root, myRoot, doDistributedAssembly, refParams, boxes, cells, coords, assembleOnRoot=assembleOnRoot)
         lenPfar = len(Pfar)
         if doDistributedAssembly:
             lenPfar = self.comm.bcast(lenPfar)
@@ -2123,20 +2172,20 @@ cdef class nonlocalBuilder:
             with self.PLogger.Timer('leaf values'):
                 # get leave values
                 if s.max < 1.:
-                    root.enterLeafValues(mesh, DoFMap, interpolation_order, boxes, self.comm, assembleOnRoot=assembleOnRoot)
+                    root.enterLeafValues(mesh, DoFMap, refParams.interpolation_order, boxes, self.comm, assembleOnRoot=assembleOnRoot)
                 elif s.min > 1:
-                    root.enterLeafValuesGrad(mesh, DoFMap, interpolation_order, boxes, self.comm)
+                    root.enterLeafValuesGrad(mesh, DoFMap, refParams.interpolation_order, boxes, self.comm)
                 else:
                     raise NotImplementedError()
 
             if self.comm is None or (assembleOnRoot and self.comm.rank == 0) or (not assembleOnRoot):
                 with self.PLogger.Timer('far field'):
                     # get kernel interpolations
-                    assembleFarFieldInteractions(self.local_matrix.kernel, Pfar, interpolation_order, DoFMap)
+                    assembleFarFieldInteractions(self.local_matrix.kernel, Pfar, refParams.interpolation_order, DoFMap)
 
                 with self.PLogger.Timer('transfer matrices'):
                     # get transfer matrices
-                    root.prepareTransferOperators(interpolation_order)
+                    root.prepareTransferOperators(refParams.interpolation_order)
 
                 if self.comm is None or (assembleOnRoot and self.comm.rank == 0):
                     h2 = H2Matrix(root, Pfar, Anear)
@@ -2504,10 +2553,12 @@ cdef LinearOperator getSparseNearField(DoFMap DoFMap, list Pnear, bint symmetric
 
 cdef class nearFieldClusterPair:
     def __init__(self, tree_node n1, tree_node n2):
-        cdef:
-            indexSet cells1, cells2
         self.n1 = n1
         self.n2 = n2
+
+    cdef void set_cells(self):
+        cdef:
+            indexSet cells1, cells2
         cells1 = self.n1.get_cells()
         cells2 = self.n2.get_cells()
         self.cellsUnion = cells1.union(cells2)

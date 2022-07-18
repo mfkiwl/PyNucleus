@@ -294,12 +294,8 @@ def saveDictToHDF5(params, f, ignore=set()):
             try:
                 f.attrs[key] = val
             except:
-                try:
-                    import pickle
-                    f.attrs[key] = np.void(pickle.dumps(val))
-                except:
-                    print('Failed to write \'{}\''.format(key))
-                    f.attrs[key] = str(val)
+                print('Failed to write \'{}\''.format(key))
+                f.attrs[key] = str(val)
 
 
 def loadDictFromHDF5(f):
@@ -311,11 +307,7 @@ def loadDictFromHDF5(f):
         if isinstance(f.attrs[key], h5py.Empty):
             params[key] = None
         else:
-            try:
-                import pickle
-                params[key] = pickle.loads(f.attrs[key])
-            except:
-                params[key] = f.attrs[key]
+            params[key] = f.attrs[key]
     for key in f:
         if isinstance(f[key], h5py.Group):
             if 'type' in f[key].attrs:
